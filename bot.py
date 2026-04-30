@@ -28,11 +28,13 @@ except ImportError:
     TZ = None
     logger.warning("zoneinfo 不可用，使用 UTC+8 固定偏移")
 
-from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
+from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup, ReplyKeyboardMarkup, KeyboardButton
 from telegram.ext import (
     Application,
     CommandHandler,
     CallbackQueryHandler,
+    MessageHandler,
+    filters,
     ContextTypes,
 )
 
@@ -393,26 +395,19 @@ def build_admin_summary_report(days: int = 30) -> str:
 def btn(text: str, data: str) -> InlineKeyboardButton:
     return InlineKeyboardButton(text, callback_data=data)
 
-def main_keyboard(is_admin: bool = False) -> InlineKeyboardMarkup:
+def main_keyboard(is_admin: bool = False) -> ReplyKeyboardMarkup:
+    """输入框下方的持久回复键盘"""
     kb = [
-        [btn("🏢 上班打卡", "clock_in"), btn("🏠 下班打卡", "clock_out")],
-        [btn("📋 日报", "report_daily"), btn("📋 周报", "report_weekly")],
-        [btn("📋 月报", "report_monthly"), btn("⚙️ 设置", "settings")],
+        ["🏢 上班打卡", "🏠 下班打卡"],
+        ["📋 日报", "📋 周报", "📋 月报"],
+        ["⚙️ 设置"],
     ]
     if is_admin:
-        kb.append([btn("👑 管理员面板", "admin_panel")])
-    return InlineKeyboardMarkup(kb)
-
-def time_range_keyboard(source: str = "") -> InlineKeyboardMarkup:
-    """时间范围选择键盘，source 用于返回时知道从哪来的"""
-    kb = [
-        [btn("📅 近3天", f"range_3_{source}"), btn("📅 近7天", f"range_7_{source}")],
-        [btn("📅 近15天", f"range_15_{source}"), btn("📅 近30天", f"range_30_{source}")],
-        [btn("🔙 返回主菜单", "main_menu")],
-    ]
-    return InlineKeyboardMarkup(kb)
+        kb.append(["👑 管理员面板"])
+    return ReplyKeyboardMarkup(kb, resize_keyboard=True, is_persistent=True)
 
 def admin_keyboard() -> InlineKeyboardMarkup:
+    """管理员内联键盘（子菜单）"""
     kb = [
         [btn("📋 今日日报", "admin_daily")],
         [btn("📋 本周周报", "admin_weekly")],
@@ -423,6 +418,7 @@ def admin_keyboard() -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(kb)
 
 def settings_keyboard(reminder_on: bool) -> InlineKeyboardMarkup:
+    """设置内联键盘（子菜单）"""
     label = "✅ 打卡提醒已开启" if reminder_on else "❌ 打卡提醒已关闭"
     kb = [
         [btn(label, "toggle_reminder")],
@@ -438,7 +434,7 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     is_admin = user.id in ADMIN_IDS
     await update.message.reply_text(
         "👋 欢迎使用考勤打卡机器人！\n\n"
-        "📌 点击下方按钮操作：\n"
+        "📌 使用下方按键操作：\n"
         "🏢 上班打卡 / 🏠 下班打卡\n"
         "📋 日报 / 周报 / 月报\n"
         "⚙️ 个人设置\n\n"
@@ -454,19 +450,17 @@ async def menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(
         "📖 <b>考勤打卡机器人使用帮助</b>\n\n"
-        "<b>打卡操作：</b>\n"
+        "<b>输入框下方按键：</b>\n"
         "🏢 上班打卡 — 记录上班时间\n"
-        "🏠 下班打卡 — 需先上班打卡\n\n"
-        "<b>报表查询：</b>\n"
-        "📋 日报 — 查看今日打卡明细\n"
-        "📋 周报 — 查看本周打卡情况\n"
-        "📋 月报 — 查看本月打卡统计\n\n"
-        "<b>设置：</b>\n"
-        "⚙️ 设置 — 开启/关闭打卡提醒\n\n"
+        "🏠 下班打卡 — 需先上班打卡\n"
+        "📋 日报 — 今日打卡明细\n"
+        "📋 周报 — 本周打卡情况\n"
+        "📋 月报 — 本月打卡统计\n"
+        "⚙️ 设置 — 开启/关闭提醒\n"
+        "👑 管理员面板（管理员可见）\n\n"
         "<b>管理员命令：</b>\n"
         "/today_all — 今日全员记录\n"
-        "/summary — 近30天统计\n"
-        "👑 管理员面板（按钮入口）\n\n"
+        "/summary — 近30天统计\n\n"
         "/start — 启动机器人\n"
         "/menu — 显示主菜单",
         parse_mode="HTML",
@@ -475,7 +469,80 @@ async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 # ==================== 按钮回调处理 ====================
 
+# ==================== 回复键盘点击处理（输入框下方的按键）====================
+
+REPLY_KEYS = {
+    "🏢 上班打卡": "clock_in",
+    "🏠 下班打卡": "clock_out",
+    "📋 日报": "report_daily",
+    "📋 周报": "report_weekly",
+    "📋 月报": "report_monthly",
+    "⚙️ 设置": "settings",
+    "👑 管理员面板": "admin_panel",
+}
+
+async def reply_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """处理输入框下方回复键盘的点击"""
+    user = update.effective_user
+    user_id = user.id
+    username = user.username or ""
+    first_name = user.first_name or ""
+    is_admin = user_id in ADMIN_IDS
+    text = update.message.text.strip()
+
+    action = REPLY_KEYS.get(text)
+    if not action:
+        return
+
+    if action == "clock_in":
+        now = record_action(user_id, username, first_name, "in")
+        await update.message.reply_text(
+            f"✅ <b>{first_name}</b>，上班打卡成功！\n🕐 {now}",
+            reply_markup=main_keyboard(is_admin), parse_mode="HTML",
+        )
+
+    elif action == "clock_out":
+        records = get_records(user_id)
+        has_in = any(r[0] == "in" for r in records)
+        if not has_in:
+            await update.message.reply_text("⚠️ 今天还没有上班打卡，请先上班打卡！", reply_markup=main_keyboard(is_admin))
+            return
+        now = record_action(user_id, username, first_name, "out")
+        await update.message.reply_text(
+            f"✅ <b>{first_name}</b>，下班打卡成功！\n🕐 {now}",
+            reply_markup=main_keyboard(is_admin), parse_mode="HTML",
+        )
+
+    elif action == "report_daily":
+        report = build_daily_report(user_id, first_name)
+        await update.message.reply_text(report, reply_markup=main_keyboard(is_admin), parse_mode="HTML")
+
+    elif action == "report_weekly":
+        report = build_weekly_report(user_id, first_name)
+        await update.message.reply_text(report, reply_markup=main_keyboard(is_admin), parse_mode="HTML")
+
+    elif action == "report_monthly":
+        report = build_monthly_report(user_id, first_name)
+        await update.message.reply_text(report, reply_markup=main_keyboard(is_admin), parse_mode="HTML")
+
+    elif action == "settings":
+        prefs = get_user_prefs(user_id, username, first_name)
+        await update.message.reply_text(
+            f"⚙️ <b>{first_name}</b> 的个人设置",
+            reply_markup=settings_keyboard(prefs["reminder"]), parse_mode="HTML",
+        )
+
+    elif action == "admin_panel":
+        if not is_admin:
+            await update.message.reply_text("⛔ 你没有管理员权限！", reply_markup=main_keyboard(False))
+            return
+        await update.message.reply_text("👑 <b>管理员面板</b>", reply_markup=admin_keyboard(), parse_mode="HTML")
+
+
+# ==================== 内联按钮回调处理（子菜单）====================
+
 async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """处理内联键盘按钮（设置、管理员面板等子菜单）"""
     query = update.callback_query
     await query.answer()
 
@@ -486,67 +553,8 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     is_admin = user_id in ADMIN_IDS
     data = query.data
 
-    # ---------- 打卡 ----------
-    if data == "clock_in":
-        now = record_action(user_id, username, first_name, "in")
-        await query.message.reply_text(
-            f"✅ <b>{first_name}</b>，上班打卡成功！\n🕐 {now}",
-            reply_markup=main_keyboard(is_admin), parse_mode="HTML",
-        )
-        await query.edit_message_reply_markup(reply_markup=None)
-
-    elif data == "clock_out":
-        records = get_records(user_id)
-        has_in = any(r[0] == "in" for r in records)
-        if not has_in:
-            await query.message.reply_text("⚠️ 今天还没有上班打卡，请先上班打卡！", reply_markup=main_keyboard(is_admin))
-            await query.edit_message_reply_markup(reply_markup=None)
-            return
-        now = record_action(user_id, username, first_name, "out")
-        await query.message.reply_text(
-            f"✅ <b>{first_name}</b>，下班打卡成功！\n🕐 {now}",
-            reply_markup=main_keyboard(is_admin), parse_mode="HTML",
-        )
-        await query.edit_message_reply_markup(reply_markup=None)
-
-    # ---------- 个人报表 ----------
-    elif data == "report_daily":
-        report = build_daily_report(user_id, first_name)
-        await query.message.reply_text(report, reply_markup=main_keyboard(is_admin), parse_mode="HTML")
-        await query.edit_message_reply_markup(reply_markup=None)
-
-    elif data == "report_weekly":
-        report = build_weekly_report(user_id, first_name)
-        await query.message.reply_text(report, reply_markup=main_keyboard(is_admin), parse_mode="HTML")
-        await query.edit_message_reply_markup(reply_markup=None)
-
-    elif data == "report_monthly":
-        report = build_monthly_report(user_id, first_name)
-        await query.message.reply_text(report, reply_markup=main_keyboard(is_admin), parse_mode="HTML")
-        await query.edit_message_reply_markup(reply_markup=None)
-
-    # ---------- 时间范围查询 ----------
-    elif data.startswith("range_"):
-        parts = data.split("_")
-        days = int(parts[1])
-        from_date = (datetime.now(TZ) - timedelta(days=days)).strftime("%Y-%m-%d")
-        records = get_records(user_id, from_date)
-        title = f"{first_name} · 近 {days} 天打卡记录"
-        report = format_records_table(records, title)
-        await query.message.reply_text(report, reply_markup=main_keyboard(is_admin), parse_mode="HTML")
-        await query.edit_message_reply_markup(reply_markup=None)
-
-    # ---------- 导航 ----------
-    elif data == "main_menu":
+    if data == "main_menu":
         await query.message.reply_text("📌 请选择操作：", reply_markup=main_keyboard(is_admin))
-        await query.edit_message_reply_markup(reply_markup=None)
-
-    elif data == "settings":
-        prefs = get_user_prefs(user_id, username, first_name)
-        await query.message.reply_text(
-            f"⚙️ <b>{first_name}</b> 的个人设置",
-            reply_markup=settings_keyboard(prefs["reminder"]), parse_mode="HTML",
-        )
         await query.edit_message_reply_markup(reply_markup=None)
 
     elif data == "toggle_reminder":
@@ -555,15 +563,6 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await query.message.reply_text(
             f"✅ 打卡提醒已{status}！", reply_markup=settings_keyboard(new_state),
         )
-        await query.edit_message_reply_markup(reply_markup=None)
-
-    # ---------- 管理员面板 ----------
-    elif data == "admin_panel":
-        if not is_admin:
-            await query.message.reply_text("⛔ 你没有管理员权限！", reply_markup=main_keyboard(False))
-            await query.edit_message_reply_markup(reply_markup=None)
-            return
-        await query.message.reply_text("👑 <b>管理员面板</b>", reply_markup=admin_keyboard(), parse_mode="HTML")
         await query.edit_message_reply_markup(reply_markup=None)
 
     elif data == "admin_daily":
@@ -599,10 +598,6 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             label = "上班" if action == "in" else "下班"
             lines.append(f"{emoji} {display} — {label}：{ts[11:19]}")
         await query.message.reply_text("\n".join(lines), reply_markup=admin_keyboard(), parse_mode="HTML")
-        await query.edit_message_reply_markup(reply_markup=None)
-
-    else:
-        await query.message.reply_text("📌 请选择操作：", reply_markup=main_keyboard(is_admin))
         await query.edit_message_reply_markup(reply_markup=None)
 
 
@@ -669,7 +664,13 @@ def main():
     app.add_handler(CommandHandler("help", help_command))
     app.add_handler(CommandHandler("today_all", today_all))
     app.add_handler(CommandHandler("summary", summary_cmd))
+
+    # 回复键盘（输入框下方的按键）→ 放在命令后面，避免抢命令
+    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, reply_handler))
+
+    # 内联按钮（子菜单）
     app.add_handler(CallbackQueryHandler(button_handler))
+
     app.add_error_handler(error_handler)
 
     logger.info("考勤机器人已启动...")
