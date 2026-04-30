@@ -6,8 +6,12 @@ Telegram 考勤打卡机器人
 
 import os
 import sys
+import json
+import socket
 import sqlite3
 import logging
+import threading
+from http.server import HTTPServer, BaseHTTPRequestHandler
 from datetime import datetime, timedelta
 
 # ---------- 日志 ----------
@@ -595,6 +599,28 @@ async def error_handler(update: object, context: ContextTypes.DEFAULT_TYPE):
     logger.error(f"更新 {update} 时发生错误：{context.error}", exc_info=True)
 
 
+# ==================== Health Check Web 服务 ====================
+
+class HealthHandler(BaseHTTPRequestHandler):
+    """Railway 健康检查用，返回 200 OK"""
+    def do_GET(self):
+        self.send_response(200)
+        self.send_header("Content-Type", "application/json")
+        self.end_headers()
+        self.wfile.write(json.dumps({"status": "ok", "service": "attendance-bot"}).encode())
+    def log_message(self, format, *args):
+        logger.debug("Health: %s", format % args)
+
+
+def start_health_server():
+    """在后台线程启动健康检查 HTTP 服务器"""
+    port = int(os.environ.get("PORT", 8080))
+    server = HTTPServer(("0.0.0.0", port), HealthHandler)
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    logger.info("健康检查 HTTP 服务器已启动，端口：%d", port)
+
+
 # ==================== 主函数 ====================
 
 def main():
@@ -604,6 +630,9 @@ def main():
     if DB_TYPE == "postgres" and not DATABASE_URL:
         logger.error("使用 PostgreSQL 但未设置 DATABASE_URL 环境变量！")
         sys.exit(1)
+
+    # 启动健康检查 HTTP 服务（Railway 需要）
+    start_health_server()
 
     init_db()
 
