@@ -1,13 +1,12 @@
 """
 Telegram 考勤打卡机器人
-功能：上下班打卡、查询记录、管理员面板、个人设置
+功能：上下班打卡、日报/周报/月报、管理员面板、个人设置
 支持 SQLite（本地）和 PostgreSQL（Railway 生产环境）
 """
 
 import os
 import sys
 import json
-import socket
 import sqlite3
 import logging
 import threading
@@ -21,13 +20,13 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
-# ---------- 时区处理 ----------
+# ---------- 时区 ----------
 try:
     from zoneinfo import ZoneInfo
     TZ = ZoneInfo("Asia/Shanghai")
 except ImportError:
     TZ = None
-    logger.warning("zoneinfo 不可用，使用 UTC+8 固定偏移修复")
+    logger.warning("zoneinfo 不可用，使用 UTC+8 固定偏移")
 
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import (
@@ -39,9 +38,7 @@ from telegram.ext import (
 
 # ---------- 配置 ----------
 BOT_TOKEN = os.environ.get("BOT_TOKEN", "")
-ADMIN_IDS = set(
-    int(uid) for uid in os.environ.get("ADMIN_IDS", "").split(",") if uid
-)
+ADMIN_IDS = set(int(uid) for uid in os.environ.get("ADMIN_IDS", "").split(",") if uid)
 DB_TYPE = os.environ.get("DB_TYPE", "sqlite").lower()
 DB_PATH = os.environ.get("DB_PATH", "attendance.db")
 DATABASE_URL = os.environ.get("DATABASE_URL", "")
@@ -50,19 +47,25 @@ DATABASE_URL = os.environ.get("DATABASE_URL", "")
 # ==================== 时间工具 ====================
 
 def now_str() -> str:
-    if TZ:
-        return datetime.now(TZ).strftime("%Y-%m-%d %H:%M:%S")
+    if TZ: return datetime.now(TZ).strftime("%Y-%m-%d %H:%M:%S")
     return (datetime.utcnow() + timedelta(hours=8)).strftime("%Y-%m-%d %H:%M:%S")
 
 def today_str() -> str:
-    if TZ:
-        return datetime.now(TZ).strftime("%Y-%m-%d")
+    if TZ: return datetime.now(TZ).strftime("%Y-%m-%d")
     return (datetime.utcnow() + timedelta(hours=8)).strftime("%Y-%m-%d")
 
-def this_month_str() -> str:
-    if TZ:
-        return datetime.now(TZ).strftime("%Y-%m")
+def week_range_str() -> tuple:
+    """返回本周一的日期字符串和今天"""
+    if TZ: today = datetime.now(TZ)
+    else: today = datetime.utcnow() + timedelta(hours=8)
+    monday = today - timedelta(days=today.weekday())
+    return monday.strftime("%Y-%m-%d"), today.strftime("%Y-%m-%d")
+
+def month_str() -> str:
+    if TZ: return datetime.now(TZ).strftime("%Y-%m")
     return (datetime.utcnow() + timedelta(hours=8)).strftime("%Y-%m")
+
+CN_WEEKDAYS = ["周一", "周二", "周三", "周四", "周五", "周六", "周日"]
 
 
 # ==================== 数据库操作 ====================
@@ -73,20 +76,20 @@ def get_conn():
         return psycopg2.connect(DATABASE_URL)
     return sqlite3.connect(DB_PATH)
 
+def _q(sql: str) -> str:
+    return sql.replace("?", "%s") if DB_TYPE == "postgres" else sql
 
-def _pg_qmark(sql: str) -> str:
-    """将 SQLite 的 ? 占位符替换为 PostgreSQL 的 %s"""
-    return sql.replace("?", "%s")
-
+def _pg_date(sql: str) -> str:
+    """PostgreSQL 的 DATE() 兼容"""
+    if DB_TYPE == "postgres":
+        return sql.replace("DATE(", "DATE(")
+    return sql
 
 def init_db():
     conn = get_conn()
     cur = conn.cursor()
-    is_pg = DB_TYPE == "postgres"
-    q = _pg_qmark if is_pg else lambda x: x
-
-    # 考勤表
-    if is_pg:
+    q = _q
+    if DB_TYPE == "postgres":
         cur.execute("""
             CREATE TABLE IF NOT EXISTS attendance (
                 id          SERIAL PRIMARY KEY,
@@ -97,9 +100,16 @@ def init_db():
                 timestamp   TEXT NOT NULL
             )
         """)
+        cur.execute("CREATE INDEX IF NOT EXISTS idx_attendance_user_date ON attendance (user_id, timestamp)")
         cur.execute("""
-            CREATE INDEX IF NOT EXISTS idx_attendance_user_date
-            ON attendance (user_id, timestamp)
+            CREATE TABLE IF NOT EXISTS user_prefs (
+                user_id    BIGINT PRIMARY KEY,
+                username   TEXT,
+                first_name TEXT,
+                reminder   INTEGER NOT NULL DEFAULT 1,
+                created_at TEXT NOT NULL,
+                updated_at TEXT NOT NULL
+            )
         """)
     else:
         cur.execute("""
@@ -112,105 +122,63 @@ def init_db():
                 timestamp   TEXT NOT NULL
             )
         """)
-
-    # 用户偏好表
-    cur.execute(q("""
-        CREATE TABLE IF NOT EXISTS user_prefs (
-            user_id    INTEGER PRIMARY KEY,
-            username   TEXT,
-            first_name TEXT,
-            reminder   INTEGER NOT NULL DEFAULT 1,
-            created_at TEXT NOT NULL,
-            updated_at TEXT NOT NULL
-        )
-    """))
-
+        cur.execute("""
+            CREATE TABLE IF NOT EXISTS user_prefs (
+                user_id    INTEGER PRIMARY KEY,
+                username   TEXT,
+                first_name TEXT,
+                reminder   INTEGER NOT NULL DEFAULT 1,
+                created_at TEXT NOT NULL,
+                updated_at TEXT NOT NULL
+            )
+        """)
     conn.commit()
     conn.close()
-    logger.info("数据库表初始化完成（类型：%s）", DB_TYPE)
+    logger.info("数据库初始化完成（类型：%s）", DB_TYPE)
 
 
-# ---------- 考勤操作 ----------
+# ---------- 考勤 CRUD ----------
 
 def record_action(user_id: int, username: str, first_name: str, action: str) -> str:
     ts = now_str()
     conn = get_conn()
     cur = conn.cursor()
-    q = _pg_qmark if DB_TYPE == "postgres" else lambda x: x
-    cur.execute(q(
-        "INSERT INTO attendance (user_id, username, first_name, action, timestamp) VALUES (?, ?, ?, ?, ?)"
-    ), (user_id, username, first_name, action, ts))
+    cur.execute(_q("INSERT INTO attendance (user_id, username, first_name, action, timestamp) VALUES (?, ?, ?, ?, ?)"),
+                (user_id, username, first_name, action, ts))
     conn.commit()
     conn.close()
     return ts
 
 
-def get_today_record(user_id: int):
-    today = today_str()
+def get_records(user_id: int, from_date: str = None, to_date: str = None):
+    """通用查询，可指定日期范围"""
     conn = get_conn()
     cur = conn.cursor()
-    q = _pg_qmark if DB_TYPE == "postgres" else lambda x: x
-    cur.execute(q(
-        "SELECT action, timestamp FROM attendance WHERE user_id = ? AND timestamp LIKE ? ORDER BY timestamp"
-    ), (user_id, f"{today}%"))
-    rows = cur.fetchall()
-    conn.close()
-    return rows
-
-
-def get_user_records(user_id: int, days: int = 7):
-    from_date = (datetime.now(TZ) - timedelta(days=days)).strftime("%Y-%m-%d")
-    conn = get_conn()
-    cur = conn.cursor()
-    q = _pg_qmark if DB_TYPE == "postgres" else lambda x: x
-    cur.execute(q(
-        "SELECT action, timestamp FROM attendance WHERE user_id = ? AND timestamp >= ? ORDER BY timestamp DESC"
-    ), (user_id, from_date))
-    rows = cur.fetchall()
-    conn.close()
-    return rows
-
-
-def get_month_records(user_id: int):
-    """查询用户本月打卡记录"""
-    month = this_month_str()
-    conn = get_conn()
-    cur = conn.cursor()
-    q = _pg_qmark if DB_TYPE == "postgres" else lambda x: x
-    cur.execute(q(
-        "SELECT action, timestamp FROM attendance WHERE user_id = ? AND timestamp LIKE ? ORDER BY timestamp"
-    ), (user_id, f"{month}%"))
-    rows = cur.fetchall()
-    conn.close()
-    return rows
-
-
-def get_all_today_records():
-    today = today_str()
-    conn = get_conn()
-    cur = conn.cursor()
-    q = _pg_qmark if DB_TYPE == "postgres" else lambda x: x
-    cur.execute(q(
-        "SELECT user_id, username, first_name, action, timestamp FROM attendance WHERE timestamp LIKE ? ORDER BY timestamp"
-    ), (f"{today}%",))
-    rows = cur.fetchall()
-    conn.close()
-    return rows
-
-
-def get_summary(days: int = 30):
-    from_date = (datetime.now(TZ) - timedelta(days=days)).strftime("%Y-%m-%d")
-    conn = get_conn()
-    cur = conn.cursor()
-    q = _pg_qmark if DB_TYPE == "postgres" else lambda x: x
-    if DB_TYPE == "postgres":
-        cur.execute(q(
-            "SELECT user_id, username, first_name, action, DATE(timestamp) FROM attendance WHERE timestamp >= ? ORDER BY timestamp DESC"
-        ), (from_date,))
+    if from_date and to_date:
+        cur.execute(_q("SELECT action, timestamp FROM attendance WHERE user_id = ? AND timestamp >= ? AND timestamp <= ? ORDER BY timestamp"),
+                    (user_id, from_date, to_date + " 23:59:59"))
+    elif from_date:
+        cur.execute(_q("SELECT action, timestamp FROM attendance WHERE user_id = ? AND timestamp >= ? ORDER BY timestamp DESC"),
+                    (user_id, from_date))
     else:
-        cur.execute(q(
-            "SELECT user_id, username, first_name, action, DATE(timestamp) FROM attendance WHERE timestamp >= ? ORDER BY timestamp DESC"
-        ), (from_date,))
+        today = today_str()
+        cur.execute(_q("SELECT action, timestamp FROM attendance WHERE user_id = ? AND timestamp LIKE ? ORDER BY timestamp"),
+                    (user_id, f"{today}%"))
+    rows = cur.fetchall()
+    conn.close()
+    return rows
+
+
+def get_all_users_records(from_date: str, to_date: str = None):
+    """管理员：查询所有用户在日期范围内的记录"""
+    conn = get_conn()
+    cur = conn.cursor()
+    if to_date:
+        cur.execute(_q("SELECT user_id, username, first_name, action, timestamp FROM attendance WHERE timestamp >= ? AND timestamp <= ? ORDER BY timestamp"),
+                    (from_date, to_date + " 23:59:59"))
+    else:
+        cur.execute(_q("SELECT user_id, username, first_name, action, timestamp FROM attendance WHERE timestamp LIKE ? ORDER BY timestamp"),
+                    (f"{from_date}%",))
     rows = cur.fetchall()
     conn.close()
     return rows
@@ -221,57 +189,203 @@ def get_summary(days: int = 30):
 def get_user_prefs(user_id: int, username: str, first_name: str) -> dict:
     conn = get_conn()
     cur = conn.cursor()
-    q = _pg_qmark if DB_TYPE == "postgres" else lambda x: x
-    cur.execute(q("SELECT * FROM user_prefs WHERE user_id = ?"), (user_id,))
+    cur.execute(_q("SELECT * FROM user_prefs WHERE user_id = ?"), (user_id,))
     row = cur.fetchone()
     now = now_str()
     if not row:
-        # 创建默认偏好
-        cur.execute(q(
-            "INSERT INTO user_prefs (user_id, username, first_name, reminder, created_at, updated_at) VALUES (?, ?, ?, 1, ?, ?)"
-        ), (user_id, username, first_name, now, now))
+        cur.execute(_q("INSERT INTO user_prefs (user_id, username, first_name, reminder, created_at, updated_at) VALUES (?, ?, ?, 1, ?, ?)"),
+                    (user_id, username, first_name, now, now))
         conn.commit()
-        cur.execute(q("SELECT * FROM user_prefs WHERE user_id = ?"), (user_id,))
+        cur.execute(_q("SELECT * FROM user_prefs WHERE user_id = ?"), (user_id,))
         row = cur.fetchone()
     conn.close()
-    if DB_TYPE == "postgres":
-        return {"user_id": row[0], "username": row[1], "first_name": row[2], "reminder": row[3], "created_at": row[4], "updated_at": row[5]}
-    return {"user_id": row[0], "username": row[1], "first_name": row[2], "reminder": row[3], "created_at": row[4], "updated_at": row[5]}
+    cols = ["user_id", "username", "first_name", "reminder", "created_at", "updated_at"]
+    return dict(zip(cols, row))
 
 
 def toggle_reminder(user_id: int) -> bool:
-    """切换提醒开关，返回新的状态"""
     conn = get_conn()
     cur = conn.cursor()
-    q = _pg_qmark if DB_TYPE == "postgres" else lambda x: x
-    cur.execute(q("SELECT reminder FROM user_prefs WHERE user_id = ?"), (user_id,))
+    cur.execute(_q("SELECT reminder FROM user_prefs WHERE user_id = ?"), (user_id,))
     row = cur.fetchone()
     new_val = 0 if row and row[0] == 1 else 1
-    now = now_str()
-    cur.execute(q(
-        "UPDATE user_prefs SET reminder = ?, updated_at = ? WHERE user_id = ?"
-    ), (new_val, now, user_id))
+    cur.execute(_q("UPDATE user_prefs SET reminder = ?, updated_at = ? WHERE user_id = ?"), (new_val, now_str(), user_id))
     conn.commit()
     conn.close()
     return bool(new_val)
 
 
-def get_user_month_stats(user_id: int):
-    """获取用户本月打卡统计"""
-    records = get_month_records(user_id)
+# ==================== 报表生成 ====================
+
+def format_records_table(records, title: str) -> str:
+    """将打卡记录格式化为美观表格"""
     if not records:
-        return None
+        return f"📭 {title}\n\n暂无打卡记录。"
+    lines = [f"📋 <b>{title}</b>\n", "━" * 30]
+    for action, ts in records:
+        date_part = ts[:10]
+        time_part = ts[11:19]
+        emoji = "🏢" if action == "in" else "🏠"
+        label = "上班" if action == "in" else "下班"
+        lines.append(f"{emoji} {date_part}  {label}  {time_part}")
+    lines.append("━" * 30)
+    return "\n".join(lines)
+
+
+def build_daily_report(user_id: int, first_name: str) -> str:
+    """生成个人日报"""
+    records = get_records(user_id, today_str())
+    title = f"{first_name} · 今日考勤日报"
+    return format_records_table(records, title)
+
+
+def build_weekly_report(user_id: int, first_name: str) -> str:
+    """生成个人周报（本周一到今天）"""
+    mon, today = week_range_str()
+    records = get_records(user_id, mon)
+    if not records:
+        return f"📭 <b>{first_name}</b> · 本周考勤周报\n\n本周暂无打卡记录。"
+    title = f"{first_name} · 本周考勤周报（{mon} ~ {today}）"
     # 按天分组
     days = {}
     for action, ts in records:
-        date = ts[:10]  # YYYY-MM-DD
-        if date not in days:
-            days[date] = set()
-        days[date].add(action)
+        d = ts[:10]
+        if d not in days:
+            days[d] = {}
+        days[d][action] = ts[11:19]
+    lines = [f"📋 <b>{title}</b>\n", "━" * 30]
+    for d in sorted(days.keys(), reverse=True):
+        acts = days[d]
+        wd = datetime.strptime(d, "%Y-%m-%d").weekday()
+        cw = CN_WEEKDAYS[wd]
+        clock_in = acts.get("in", "—")
+        clock_out = acts.get("out", "—")
+        if clock_in != "—" and clock_out != "—":
+            status = "✅"
+        elif clock_in != "—":
+            status = "⚠️"
+        else:
+            status = "❌"
+        lines.append(f"{status} {d} {cw}")
+        lines.append(f"   🏢 上班 {clock_in}  🏠 下班 {clock_out}")
+    lines.append("━" * 30)
+    # 统计
     total = len(days)
-    normal = sum(1 for acts in days.values() if "in" in acts and "out" in acts)
-    late = sum(1 for d, acts in days.items() if "in" in acts and "out" not in acts)
-    return {"total": total, "normal": normal, "late": late, "days": days}
+    normal = sum(1 for a in days.values() if "in" in a and "out" in a)
+    late = sum(1 for a in days.values() if "in" in a and "out" not in a)
+    lines.append(f"📊 出勤 {total} 天 | 正常 {normal} 天 | 异常 {late} 天")
+    return "\n".join(lines)
+
+
+def build_monthly_report(user_id: int, first_name: str) -> str:
+    """生成个人月报"""
+    month = month_str()
+    records = get_records(user_id, month + "-01")
+    if not records:
+        return f"📭 <b>{first_name}</b> · {month} 月考勤月报\n\n本月暂无打卡记录。"
+    title = f"{first_name} · {month} 月考勤月报"
+    days = {}
+    for action, ts in records:
+        d = ts[:10]
+        if d not in days:
+            days[d] = {}
+        days[d][action] = ts[11:19]
+    lines = [f"📋 <b>{title}</b>\n", "━" * 30]
+    for d in sorted(days.keys(), reverse=True):
+        acts = days[d]
+        clock_in = acts.get("in", "—")
+        clock_out = acts.get("out", "—")
+        if clock_in != "—" and clock_out != "—":
+            status = "✅"
+        elif clock_in != "—":
+            status = "⚠️"
+        else:
+            status = "❌"
+        lines.append(f"{status} {d}  🏢{clock_in}  🏠{clock_out}")
+    lines.append("━" * 30)
+    total = len(days)
+    normal = sum(1 for a in days.values() if "in" in a and "out" in a)
+    lines.append(f"📊 出勤 {total} 天 | 正常 {normal} 天")
+    return "\n".join(lines)
+
+
+def build_admin_daily_report() -> str:
+    """管理员日报：今日全员打卡"""
+    today = today_str()
+    records = get_all_users_records(today)
+    if not records:
+        return "📭 今日全员日报\n\n今天还没有任何人打卡。"
+    users = {}
+    for uid, uname, fname, action, ts in records:
+        name = fname or uname or str(uid)
+        if name not in users:
+            users[name] = {}
+        users[name][action] = ts[11:19]
+    lines = [f"📋 <b>今日全员考勤日报（{today}）</b>\n", "━" * 30]
+    for name in sorted(users.keys()):
+        acts = users[name]
+        ci = acts.get("in", "—")
+        co = acts.get("out", "—")
+        if ci != "—" and co != "—":
+            status = "✅"
+        elif ci != "—":
+            status = "⚠️"
+        else:
+            status = "❌"
+        lines.append(f"{status} {name}  🏢{ci}  🏠{co}")
+    lines.append("━" * 30)
+    total = len(users)
+    normal = sum(1 for a in users.values() if "in" in a and "out" in a)
+    lines.append(f"👥 总人数 {total} | 已正常上下班 {normal} 人")
+    return "\n".join(lines)
+
+
+def build_admin_weekly_report() -> str:
+    """管理员周报：本周全员打卡"""
+    mon, today = week_range_str()
+    records = get_all_users_records(mon, today)
+    if not records:
+        return f"📭 本周全员周报（{mon} ~ {today}）\n\n本周暂无打卡记录。"
+    user_days = {}
+    for uid, uname, fname, action, ts in records:
+        name = fname or uname or str(uid)
+        d = ts[:10]
+        if name not in user_days:
+            user_days[name] = {}
+        if d not in user_days[name]:
+            user_days[name][d] = set()
+        user_days[name][d].add(action)
+    lines = [f"📋 <b>本周全员考勤周报（{mon} ~ {today}）</b>\n", "━" * 30]
+    for name in sorted(user_days.keys()):
+        days_data = user_days[name]
+        total = len(days_data)
+        normal = sum(1 for acts in days_data.values() if "in" in acts and "out" in acts)
+        lines.append(f"👤 {name}  出勤 {total} 天 | 正常 {normal} 天")
+    return "\n".join(lines)
+
+
+def build_admin_summary_report(days: int = 30) -> str:
+    """管理员统计报表"""
+    from_date = (datetime.now(TZ) - timedelta(days=days)).strftime("%Y-%m-%d")
+    records = get_all_users_records(from_date)
+    if not records:
+        return f"📭 近 {days} 天没有打卡记录。"
+    stats = {}
+    for uid, uname, fname, action, ts in records:
+        name = fname or uname or str(uid)
+        d = ts[:10]
+        if name not in stats:
+            stats[name] = {}
+        if d not in stats[name]:
+            stats[name][d] = set()
+        stats[name][d].add(action)
+    lines = [f"📊 <b>近 {days} 天考勤统计报表</b>\n", "━" * 30]
+    for name in sorted(stats.keys()):
+        total = len(stats[name])
+        normal = sum(1 for a in stats[name].values() if "in" in a and "out" in a)
+        lines.append(f"👤 {name}")
+        lines.append(f"   出勤 {total} 天 | 正常 {normal} 天")
+    return "\n".join(lines)
 
 
 # ==================== 键盘构建 ====================
@@ -279,41 +393,40 @@ def get_user_month_stats(user_id: int):
 def btn(text: str, data: str) -> InlineKeyboardButton:
     return InlineKeyboardButton(text, callback_data=data)
 
-
 def main_keyboard(is_admin: bool = False) -> InlineKeyboardMarkup:
-    """主菜单"""
     kb = [
         [btn("🏢 上班打卡", "clock_in"), btn("🏠 下班打卡", "clock_out")],
-        [btn("📊 今日记录", "today"), btn("📅 近7天记录", "week")],
-        [btn("📆 本月统计", "month_stats")],
-        [btn("⚙️ 个人设置", "settings")],
+        [btn("📋 日报", "report_daily"), btn("📋 周报", "report_weekly")],
+        [btn("📋 月报", "report_monthly"), btn("⚙️ 设置", "settings")],
     ]
     if is_admin:
         kb.append([btn("👑 管理员面板", "admin_panel")])
     return InlineKeyboardMarkup(kb)
 
-
-def back_btn(data: str = "main_menu") -> list:
-    return [btn("🔙 返回主菜单", data)]
-
-
-def admin_keyboard() -> InlineKeyboardMarkup:
-    """管理员面板"""
+def time_range_keyboard(source: str = "") -> InlineKeyboardMarkup:
+    """时间范围选择键盘，source 用于返回时知道从哪来的"""
     kb = [
-        [btn("📋 今日全员打卡", "admin_today_all")],
-        [btn("📈 近30天统计", "admin_summary")],
-        back_btn(),
+        [btn("📅 近3天", f"range_3_{source}"), btn("📅 近7天", f"range_7_{source}")],
+        [btn("📅 近15天", f"range_15_{source}"), btn("📅 近30天", f"range_30_{source}")],
+        [btn("🔙 返回主菜单", "main_menu")],
     ]
     return InlineKeyboardMarkup(kb)
 
+def admin_keyboard() -> InlineKeyboardMarkup:
+    kb = [
+        [btn("📋 今日日报", "admin_daily")],
+        [btn("📋 本周周报", "admin_weekly")],
+        [btn("📊 近30天统计", "admin_summary_report")],
+        [btn("👥 今日全员打卡", "admin_today_all")],
+        [btn("🔙 返回主菜单", "main_menu")],
+    ]
+    return InlineKeyboardMarkup(kb)
 
 def settings_keyboard(reminder_on: bool) -> InlineKeyboardMarkup:
-    """个人设置面板"""
-    reminder_label = "✅ 打卡提醒已开启" if reminder_on else "❌ 打卡提醒已关闭"
+    label = "✅ 打卡提醒已开启" if reminder_on else "❌ 打卡提醒已关闭"
     kb = [
-        [btn(reminder_label, "toggle_reminder")],
-        [btn("📆 本月打卡统计", "month_stats")],
-        back_btn(),
+        [btn(label, "toggle_reminder")],
+        [btn("🔙 返回主菜单", "main_menu")],
     ]
     return InlineKeyboardMarkup(kb)
 
@@ -327,37 +440,35 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "👋 欢迎使用考勤打卡机器人！\n\n"
         "📌 点击下方按钮操作：\n"
         "🏢 上班打卡 / 🏠 下班打卡\n"
-        "📊 查看打卡记录 / 本月统计\n"
+        "📋 日报 / 周报 / 月报\n"
         "⚙️ 个人设置\n\n"
         "📖 发送 /help 查看帮助",
         reply_markup=main_keyboard(is_admin),
     )
-
 
 async def menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user = update.effective_user
     is_admin = user.id in ADMIN_IDS
     await update.message.reply_text("📌 请选择操作：", reply_markup=main_keyboard(is_admin))
 
-
 async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(
         "📖 <b>考勤打卡机器人使用帮助</b>\n\n"
-        "<b>基本操作：</b>\n"
-        "🏢 上班打卡 — 点击按钮记录上班时间\n"
-        "🏠 下班打卡 — 需先上班打卡，避免漏打卡\n"
-        "📊 今日记录 — 查看今天打卡情况\n"
-        "📅 近7天记录 — 查看一周打卡历史\n"
-        "📆 本月统计 — 查看本月出勤天数\n\n"
+        "<b>打卡操作：</b>\n"
+        "🏢 上班打卡 — 记录上班时间\n"
+        "🏠 下班打卡 — 需先上班打卡\n\n"
+        "<b>报表查询：</b>\n"
+        "📋 日报 — 查看今日打卡明细\n"
+        "📋 周报 — 查看本周打卡情况\n"
+        "📋 月报 — 查看本月打卡统计\n\n"
         "<b>设置：</b>\n"
-        "⚙️ 个人设置 — 开启/关闭打卡提醒\n\n"
+        "⚙️ 设置 — 开启/关闭打卡提醒\n\n"
         "<b>管理员命令：</b>\n"
-        "/today_all — 今日全员打卡记录\n"
-        "/summary — 近30天考勤统计\n\n"
-        "<b>其他命令：</b>\n"
+        "/today_all — 今日全员记录\n"
+        "/summary — 近30天统计\n"
+        "👑 管理员面板（按钮入口）\n\n"
         "/start — 启动机器人\n"
-        "/menu — 显示主菜单\n"
-        "/help — 显示此帮助",
+        "/menu — 显示主菜单",
         parse_mode="HTML",
     )
 
@@ -373,86 +484,59 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     username = user.username or ""
     first_name = user.first_name or ""
     is_admin = user_id in ADMIN_IDS
-
     data = query.data
 
-    # ---- 打卡 ----
+    # ---------- 打卡 ----------
     if data == "clock_in":
         now = record_action(user_id, username, first_name, "in")
         await query.message.reply_text(
-            f"✅ <b>{first_name}</b>，上班打卡成功！\n"
-            f"🕐 打卡时间：{now}",
-            reply_markup=main_keyboard(is_admin),
-            parse_mode="HTML",
+            f"✅ <b>{first_name}</b>，上班打卡成功！\n🕐 {now}",
+            reply_markup=main_keyboard(is_admin), parse_mode="HTML",
         )
         await query.edit_message_reply_markup(reply_markup=None)
 
     elif data == "clock_out":
-        records = get_today_record(user_id)
+        records = get_records(user_id)
         has_in = any(r[0] == "in" for r in records)
         if not has_in:
-            await query.message.reply_text(
-                "⚠️ 你今天还没有上班打卡，请先上班打卡！",
-                reply_markup=main_keyboard(is_admin),
-            )
+            await query.message.reply_text("⚠️ 今天还没有上班打卡，请先上班打卡！", reply_markup=main_keyboard(is_admin))
             await query.edit_message_reply_markup(reply_markup=None)
             return
         now = record_action(user_id, username, first_name, "out")
         await query.message.reply_text(
-            f"✅ <b>{first_name}</b>，下班打卡成功！\n"
-            f"🕐 打卡时间：{now}",
-            reply_markup=main_keyboard(is_admin),
-            parse_mode="HTML",
+            f"✅ <b>{first_name}</b>，下班打卡成功！\n🕐 {now}",
+            reply_markup=main_keyboard(is_admin), parse_mode="HTML",
         )
         await query.edit_message_reply_markup(reply_markup=None)
 
-    # ---- 查询记录 ----
-    elif data == "today":
-        records = get_today_record(user_id)
-        if not records:
-            text = f"📭 <b>{first_name}</b>，今天还没有打卡记录。"
-        else:
-            text = f"📊 <b>{first_name}</b> 今日打卡记录：\n\n"
-            for action, ts in records:
-                emoji = "🏢" if action == "in" else "🏠"
-                label = "上班" if action == "in" else "下班"
-                text += f"{emoji} {label}：{ts}\n"
-        await query.message.reply_text(text, reply_markup=main_keyboard(is_admin), parse_mode="HTML")
+    # ---------- 个人报表 ----------
+    elif data == "report_daily":
+        report = build_daily_report(user_id, first_name)
+        await query.message.reply_text(report, reply_markup=main_keyboard(is_admin), parse_mode="HTML")
         await query.edit_message_reply_markup(reply_markup=None)
 
-    elif data == "week":
-        records = get_user_records(user_id, days=7)
-        if not records:
-            text = f"📭 <b>{first_name}</b>，近7天没有打卡记录。"
-        else:
-            text = f"📅 <b>{first_name}</b> 近7天打卡记录：\n\n"
-            for action, ts in records:
-                emoji = "🏢" if action == "in" else "🏠"
-                label = "上班" if action == "in" else "下班"
-                text += f"{emoji} {label}：{ts}\n"
-        await query.message.reply_text(text, reply_markup=main_keyboard(is_admin), parse_mode="HTML")
+    elif data == "report_weekly":
+        report = build_weekly_report(user_id, first_name)
+        await query.message.reply_text(report, reply_markup=main_keyboard(is_admin), parse_mode="HTML")
         await query.edit_message_reply_markup(reply_markup=None)
 
-    elif data == "month_stats":
-        stats = get_user_month_stats(user_id)
-        if not stats:
-            text = f"📭 <b>{first_name}</b>，本月还没有打卡记录。"
-        else:
-            text = (
-                f"📆 <b>{first_name}</b> 本月打卡统计\n\n"
-                f"📅 出勤天数：{stats['total']} 天\n"
-                f"✅ 正常上下班：{stats['normal']} 天\n"
-                f"⚠️ 未下班打卡：{stats['late']} 天\n\n"
-                "<b>每日明细：</b>\n"
-            )
-            for date in sorted(stats["days"].keys()):
-                acts = stats["days"][date]
-                status = "✅" if "in" in acts and "out" in acts else "⚠️"
-                text += f"{status} {date}\n"
-        await query.message.reply_text(text, reply_markup=main_keyboard(is_admin), parse_mode="HTML")
+    elif data == "report_monthly":
+        report = build_monthly_report(user_id, first_name)
+        await query.message.reply_text(report, reply_markup=main_keyboard(is_admin), parse_mode="HTML")
         await query.edit_message_reply_markup(reply_markup=None)
 
-    # ---- 导航 ----
+    # ---------- 时间范围查询 ----------
+    elif data.startswith("range_"):
+        parts = data.split("_")
+        days = int(parts[1])
+        from_date = (datetime.now(TZ) - timedelta(days=days)).strftime("%Y-%m-%d")
+        records = get_records(user_id, from_date)
+        title = f"{first_name} · 近 {days} 天打卡记录"
+        report = format_records_table(records, title)
+        await query.message.reply_text(report, reply_markup=main_keyboard(is_admin), parse_mode="HTML")
+        await query.edit_message_reply_markup(reply_markup=None)
+
+    # ---------- 导航 ----------
     elif data == "main_menu":
         await query.message.reply_text("📌 请选择操作：", reply_markup=main_keyboard(is_admin))
         await query.edit_message_reply_markup(reply_markup=None)
@@ -460,10 +544,8 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     elif data == "settings":
         prefs = get_user_prefs(user_id, username, first_name)
         await query.message.reply_text(
-            f"⚙️ <b>{first_name}</b> 的个人设置\n\n"
-            "你可以在这里管理打卡提醒等功能。",
-            reply_markup=settings_keyboard(prefs["reminder"]),
-            parse_mode="HTML",
+            f"⚙️ <b>{first_name}</b> 的个人设置",
+            reply_markup=settings_keyboard(prefs["reminder"]), parse_mode="HTML",
         )
         await query.edit_message_reply_markup(reply_markup=None)
 
@@ -471,154 +553,101 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         new_state = toggle_reminder(user_id)
         status = "开启" if new_state else "关闭"
         await query.message.reply_text(
-            f"✅ 打卡提醒已{status}！\n\n{('每天上班时间将收到打卡提醒。' if new_state else '已关闭打卡提醒。')}",
-            reply_markup=settings_keyboard(new_state),
+            f"✅ 打卡提醒已{status}！", reply_markup=settings_keyboard(new_state),
         )
         await query.edit_message_reply_markup(reply_markup=None)
 
-    # ---- 管理员面板 ----
+    # ---------- 管理员面板 ----------
     elif data == "admin_panel":
         if not is_admin:
-            await query.message.reply_text("⛔ 你没有管理员权限！", reply_markup=main_keyboard(is_admin))
+            await query.message.reply_text("⛔ 你没有管理员权限！", reply_markup=main_keyboard(False))
             await query.edit_message_reply_markup(reply_markup=None)
             return
-        await query.message.reply_text(
-            "👑 <b>管理员面板</b>",
-            reply_markup=admin_keyboard(),
-            parse_mode="HTML",
-        )
+        await query.message.reply_text("👑 <b>管理员面板</b>", reply_markup=admin_keyboard(), parse_mode="HTML")
+        await query.edit_message_reply_markup(reply_markup=None)
+
+    elif data == "admin_daily":
+        if not is_admin: return
+        report = build_admin_daily_report()
+        await query.message.reply_text(report, reply_markup=admin_keyboard(), parse_mode="HTML")
+        await query.edit_message_reply_markup(reply_markup=None)
+
+    elif data == "admin_weekly":
+        if not is_admin: return
+        report = build_admin_weekly_report()
+        await query.message.reply_text(report, reply_markup=admin_keyboard(), parse_mode="HTML")
+        await query.edit_message_reply_markup(reply_markup=None)
+
+    elif data == "admin_summary_report":
+        if not is_admin: return
+        report = build_admin_summary_report(30)
+        await query.message.reply_text(report, reply_markup=admin_keyboard(), parse_mode="HTML")
         await query.edit_message_reply_markup(reply_markup=None)
 
     elif data == "admin_today_all":
-        if not is_admin:
-            await query.message.reply_text("⛔ 你没有管理员权限！", reply_markup=main_keyboard(is_admin))
-            await query.edit_message_reply_markup(reply_markup=None)
-            return
-        records = get_all_today_records()
+        if not is_admin: return
+        today = today_str()
+        records = get_all_users_records(today)
         if not records:
             await query.message.reply_text("📭 今天还没有任何人打卡。", reply_markup=admin_keyboard())
             await query.edit_message_reply_markup(reply_markup=None)
             return
-        text = "📊 <b>今日全员打卡记录：</b>\n\n"
+        lines = ["📊 <b>今日全员打卡明细：</b>\n", "━" * 30]
         for uid, uname, fname, action, ts in records:
             display = fname or uname or str(uid)
             emoji = "🏢" if action == "in" else "🏠"
             label = "上班" if action == "in" else "下班"
-            text += f"{emoji} {display} — {label}：{ts}\n"
-        await query.message.reply_text(text, reply_markup=admin_keyboard(), parse_mode="HTML")
-        await query.edit_message_reply_markup(reply_markup=None)
-
-    elif data == "admin_summary":
-        if not is_admin:
-            await query.message.reply_text("⛔ 你没有管理员权限！", reply_markup=main_keyboard(is_admin))
-            await query.edit_message_reply_markup(reply_markup=None)
-            return
-        rows = get_summary(days=30)
-        if not rows:
-            await query.message.reply_text("📭 近30天没有打卡记录。", reply_markup=admin_keyboard())
-            await query.edit_message_reply_markup(reply_markup=None)
-            return
-        stats = {}
-        for uid, uname, fname, action, date in rows:
-            display = fname or uname or str(uid)
-            if uid not in stats:
-                stats[uid] = {"name": display, "days": {}}
-            if date not in stats[uid]["days"]:
-                stats[uid]["days"][date] = set()
-            stats[uid]["days"][date].add(action)
-        text = "📊 <b>近30天考勤统计：</b>\n\n"
-        for uid, data in stats.items():
-            total_days = len(data["days"])
-            normal_days = sum(
-                1 for acts in data["days"].values()
-                if "in" in acts and "out" in acts
-            )
-            text += (
-                f"👤 <b>{data['name']}</b>\n"
-                f"   出勤 {total_days} 天，正常上下班 {normal_days} 天\n\n"
-            )
-        await query.message.reply_text(text, reply_markup=admin_keyboard(), parse_mode="HTML")
+            lines.append(f"{emoji} {display} — {label}：{ts[11:19]}")
+        await query.message.reply_text("\n".join(lines), reply_markup=admin_keyboard(), parse_mode="HTML")
         await query.edit_message_reply_markup(reply_markup=None)
 
     else:
-        # 未知回调 -> 回主菜单
         await query.message.reply_text("📌 请选择操作：", reply_markup=main_keyboard(is_admin))
         await query.edit_message_reply_markup(reply_markup=None)
 
 
-# ==================== 管理员命令（兼容旧版）====================
+# ==================== 命令兼容 ====================
 
 async def today_all(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id
-    is_admin = user_id in ADMIN_IDS
-    if ADMIN_IDS and not is_admin:
+    if ADMIN_IDS and user_id not in ADMIN_IDS:
         await update.message.reply_text("⛔ 你没有管理员权限！")
         return
-    records = get_all_today_records()
-    if not records:
-        await update.message.reply_text("📭 今天还没有任何人打卡。")
-        return
-    text = "📊 <b>今日全员打卡记录：</b>\n\n"
-    for uid, uname, fname, action, ts in records:
-        display = fname or uname or str(uid)
-        emoji = "🏢" if action == "in" else "🏠"
-        label = "上班" if action == "in" else "下班"
-        text += f"{emoji} {display} — {label}：{ts}\n"
-    kb = main_keyboard(is_admin) if is_admin else None
-    await update.message.reply_text(text, reply_markup=kb, parse_mode="HTML")
+    report = build_admin_daily_report()
+    is_admin = user_id in ADMIN_IDS
+    await update.message.reply_text(report, reply_markup=main_keyboard(is_admin) if is_admin else None, parse_mode="HTML")
 
-
-async def summary(update: Update, context: ContextTypes.DEFAULT_TYPE):
+async def summary_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id
-    is_admin = user_id in ADMIN_IDS
-    if ADMIN_IDS and not is_admin:
+    if ADMIN_IDS and user_id not in ADMIN_IDS:
         await update.message.reply_text("⛔ 你没有管理员权限！")
         return
-    rows = get_summary(days=30)
-    if not rows:
-        await update.message.reply_text("📭 近30天没有打卡记录。")
-        return
-    stats = {}
-    for uid, uname, fname, action, date in rows:
-        display = fname or uname or str(uid)
-        if uid not in stats:
-            stats[uid] = {"name": display, "days": {}}
-        if date not in stats[uid]["days"]:
-            stats[uid]["days"][date] = set()
-        stats[uid]["days"][date].add(action)
-    text = "📊 <b>近30天考勤统计：</b>\n\n"
-    for uid, data in stats.items():
-        total_days = len(data["days"])
-        normal_days = sum(1 for acts in data["days"].values() if "in" in acts and "out" in acts)
-        text += f"👤 <b>{data['name']}</b>\n   出勤 {total_days} 天，正常上下班 {normal_days} 天\n\n"
-    kb = main_keyboard(is_admin) if is_admin else None
-    await update.message.reply_text(text, reply_markup=kb, parse_mode="HTML")
+    report = build_admin_summary_report(30)
+    is_admin = user_id in ADMIN_IDS
+    await update.message.reply_text(report, reply_markup=main_keyboard(is_admin) if is_admin else None, parse_mode="HTML")
 
 
 async def error_handler(update: object, context: ContextTypes.DEFAULT_TYPE):
-    logger.error(f"更新 {update} 时发生错误：{context.error}", exc_info=True)
+    logger.error(f"更新 {update} 发生错误：{context.error}", exc_info=True)
 
 
-# ==================== Health Check Web 服务 ====================
+# ==================== Health Check ====================
 
 class HealthHandler(BaseHTTPRequestHandler):
-    """Railway 健康检查用，返回 200 OK"""
     def do_GET(self):
         self.send_response(200)
         self.send_header("Content-Type", "application/json")
         self.end_headers()
         self.wfile.write(json.dumps({"status": "ok", "service": "attendance-bot"}).encode())
     def log_message(self, format, *args):
-        logger.debug("Health: %s", format % args)
-
+        pass
 
 def start_health_server():
-    """在后台线程启动健康检查 HTTP 服务器"""
     port = int(os.environ.get("PORT", 8080))
     server = HTTPServer(("0.0.0.0", port), HealthHandler)
     thread = threading.Thread(target=server.serve_forever, daemon=True)
     thread.start()
-    logger.info("健康检查 HTTP 服务器已启动，端口：%d", port)
+    logger.info("健康检查 HTTP 服务已启动，端口：%d", port)
 
 
 # ==================== 主函数 ====================
@@ -628,27 +657,19 @@ def main():
         logger.error("未设置 BOT_TOKEN 环境变量！")
         sys.exit(1)
     if DB_TYPE == "postgres" and not DATABASE_URL:
-        logger.error("使用 PostgreSQL 但未设置 DATABASE_URL 环境变量！")
+        logger.error("使用 PostgreSQL 但未设置 DATABASE_URL！")
         sys.exit(1)
 
-    # 启动健康检查 HTTP 服务（Railway 需要）
     start_health_server()
-
     init_db()
 
     app = Application.builder().token(BOT_TOKEN).build()
-
-    # 命令
     app.add_handler(CommandHandler("start", start))
     app.add_handler(CommandHandler("menu", menu))
     app.add_handler(CommandHandler("help", help_command))
     app.add_handler(CommandHandler("today_all", today_all))
-    app.add_handler(CommandHandler("summary", summary))
-
-    # 按钮
+    app.add_handler(CommandHandler("summary", summary_cmd))
     app.add_handler(CallbackQueryHandler(button_handler))
-
-    # 错误
     app.add_error_handler(error_handler)
 
     logger.info("考勤机器人已启动...")
